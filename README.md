@@ -40,7 +40,7 @@ This benchmark reveals **counter-intuitive insights** about GPU optimization on 
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/OpenCL_Benchmarker.git
+git clone https://github.com/Medinz01/OpenCL_Benchmarker.git
 cd OpenCL_Benchmarker
 
 # Create build directory
@@ -64,31 +64,6 @@ cmake --build . --config Release
 # Generate visualization (requires Python with pandas, matplotlib)
 cd ..
 python scripts/visualize_results.py
-```
-
-## 📊 Benchmark Results
-
-### Global vs Local Memory Performance
-
-<p align="center">
-  <img src="docs/images/kernel_comparison.png" width="800" alt="Kernel Performance Comparison">
-</p>
-
-**Key Insight**: Local memory optimization adds ~0.05-0.08ms fixed overhead per frame, which exceeds the benefit for small kernels due to excellent L2 cache performance.
-
-### CPU vs GPU Speedup
-
-<p align="center">
-  <img src="docs/images/speedup_chart.png" width="600" alt="CPU vs GPU Speedup">
-</p>
-
-### Transfer vs Computation Breakdown (4K)
-
-```
-Total Time: 10.2 ms
-├── Kernel Execution:  1.2 ms (12%)  ← What we optimize
-└── PCIe Transfer:     7.8 ms (76%)  ← Real bottleneck
-    └── Memory Copies: 1.2 ms (12%)
 ```
 
 ## 🔬 Why Local Memory is Slower
