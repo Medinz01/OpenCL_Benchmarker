@@ -1,0 +1,20 @@
+# Build directories
+build/
+bin/
+lib/
+
+# IDE files
+.vscode/
+.idea/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# Python
+__pycache__/
+*.pyc
+
+# Images (Keep source images, ignore outputs)
+output_*.jpg
+benchmark_results.csv
