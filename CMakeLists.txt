@@ -2,20 +2,42 @@ cmake_minimum_required(VERSION 3.10)
 project(OpenCL_Benchmarker)
 
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 1. Fix Deprecation Warnings
-# We tell the compiler we are targeting OpenCL 1.2 (compatible with everything)
-add_definitions(-DCL_TARGET_OPENCL_VERSION=120)
-
+# Find OpenCL
 find_package(OpenCL REQUIRED)
 
-include_directories(${CMAKE_SOURCE_DIR}/include)
+# Include directories
 include_directories(${OpenCL_INCLUDE_DIRS})
+include_directories(${CMAKE_SOURCE_DIR}/include)
 
-add_executable(Benchmarker src/main.cpp)
+# Original benchmark executable
+add_executable(Benchmarker 
+    src/main.cpp
+)
+
 target_link_libraries(Benchmarker ${OpenCL_LIBRARIES})
 
-# 2. FIX THE COPY PATH
-# Old: Copied kernels -> build/kernels (resulted in build/kernels/kernels/filters.cl)
-# New: Copies kernels -> build (results in build/kernels/filters.cl)
+# Comprehensive benchmark executable (NEW)
+add_executable(ComprehensiveBenchmark
+    src/comprehensive_benchmark.cpp
+)
+
+target_link_libraries(ComprehensiveBenchmark ${OpenCL_LIBRARIES})
+
+# Copy kernel files to build directory
 file(COPY ${CMAKE_SOURCE_DIR}/kernels DESTINATION ${CMAKE_BINARY_DIR})
+file(COPY ${CMAKE_SOURCE_DIR}/test_images DESTINATION ${CMAKE_BINARY_DIR})
+
+# Set output directory
+set_target_properties(Benchmarker ComprehensiveBenchmark
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/Debug
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/Release
+)
+
+# MSVC specific settings
+if(MSVC)
+    target_compile_options(Benchmarker PRIVATE /W3)
+    target_compile_options(ComprehensiveBenchmark PRIVATE /W3)
+endif()

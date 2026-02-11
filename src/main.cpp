@@ -10,7 +10,7 @@
 #include <fstream>
 #include <chrono>
 #include <string>
-#include <cstring> // for memcpy
+#include <cmath>
 
 // --- Helper: Timer ---
 class Timer {
@@ -24,222 +24,300 @@ public:
     }
 };
 
-// --- Helper: OpenCL Error Checker ---
 #define CHECK_CL(err) if (err != CL_SUCCESS) { \
     std::cerr << "OpenCL Error: " << err << " at line " << __LINE__ << std::endl; \
     exit(1); \
 }
 
+// --- Global OpenCL Handles ---
+cl_context context;
+cl_command_queue queue;
+cl_program program;
+
+// --- Load Kernel Source ---
 std::string loadKernelSource(const std::string& filename) {
     std::ifstream file(filename);
-    if (!file.is_open()) { std::cerr << "Failed to load kernel: " << filename << std::endl; exit(1); }
+    if (!file.is_open()) { 
+        std::cerr << "Failed to load kernel: " << filename << std::endl; 
+        exit(1); 
+    }
     return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 }
 
-// --- CPU ALGORITHMS ---
-void cpu_grayscale(const unsigned char* input, unsigned char* output, int width, int height) {
-    for (int i = 0; i < width * height; ++i) {
-        int idx = i * 3;
-        output[i] = (unsigned char)(0.299f * input[idx] + 0.587f * input[idx+1] + 0.114f * input[idx+2]);
-    }
-}
-
+// --- CPU Implementation ---
 void cpu_blur(const unsigned char* input, unsigned char* output, int width, int height) {
-    const float kernel[9] = {
-        1/16.0f, 2/16.0f, 1/16.0f,
-        2/16.0f, 4/16.0f, 2/16.0f,
-        1/16.0f, 2/16.0f, 1/16.0f
+    const float kernel[9] = { 
+        1/16.0f, 2/16.0f, 1/16.0f, 
+        2/16.0f, 4/16.0f, 2/16.0f, 
+        1/16.0f, 2/16.0f, 1/16.0f 
     };
-    int channels = 3;
-    for (int y = 1; y < height - 1; ++y) {
-        for (int x = 1; x < width - 1; ++x) {
+    
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
             for (int c = 0; c < 3; ++c) {
                 float sum = 0.0f;
-                int k_idx = 0;
                 for (int ky = -1; ky <= 1; ++ky) {
                     for (int kx = -1; kx <= 1; ++kx) {
-                        int p_idx = ((y + ky) * width + (x + kx)) * channels + c;
-                        sum += input[p_idx] * kernel[k_idx++];
+                        int nx = std::min(std::max(x + kx, 0), width - 1);
+                        int ny = std::min(std::max(y + ky, 0), height - 1);
+                        sum += input[(ny * width + nx) * 3 + c] * kernel[(ky+1)*3+(kx+1)];
                     }
                 }
-                output[(y*width+x)*channels + c] = (unsigned char)sum;
+                output[(y * width + x) * 3 + c] = (unsigned char)sum;
             }
         }
     }
 }
 
-int main() {
-    // 1. SETUP
-    std::string inputPath = "input.jpg";
-    int width, height, channels;
-    unsigned char* host_input = stbi_load(inputPath.c_str(), &width, &height, &channels, 0);
-    if (!host_input) { std::cerr << "Load failed. Check input.jpg" << std::endl; return 1; }
+// --- Validation Helper ---
+double compareImages(const unsigned char* img1, const unsigned char* img2, size_t size) {
+    double maxDiff = 0.0;
+    for (size_t i = 0; i < size; ++i) {
+        double diff = std::abs((int)img1[i] - (int)img2[i]);
+        maxDiff = std::max(maxDiff, diff);
+    }
+    return maxDiff;
+}
+
+// --- Enhanced GPU Test with Separate Timing ---
+struct BenchmarkResult {
+    double total_ms;      // Total time (H2D + Kernel + D2H)
+    double kernel_ms;     // Pure kernel execution time
+    double transfer_ms;   // Memory transfer overhead
+};
+
+BenchmarkResult runGpuTest(
+    const std::string& kernelName, 
+    unsigned char* host_input, 
+    unsigned char* host_output,
+    int w, int h, 
+    bool isLocal
+) {
+    size_t imgSize = w * h * 3;
+    cl_int err;
+    BenchmarkResult result;
+
+    Timer totalTimer;
     
-    std::cout << "Benchmarking Image: " << width << "x" << height << std::endl;
-    std::ofstream csv("benchmark_results.csv");
-    csv << "Algorithm,Device,Time_ms\n";
+    // Create buffers
+    cl_mem d_in = clCreateBuffer(context, CL_MEM_READ_ONLY, imgSize, NULL, &err);
+    CHECK_CL(err);
+    cl_mem d_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY, imgSize, NULL, &err);
+    CHECK_CL(err);
 
-    // Allocations
-    std::vector<unsigned char> cpu_gray_out(width * height);
-    std::vector<unsigned char> cpu_blur_out(width * height * 3);
-    std::vector<unsigned char> gpu_out(width * height * 3);
-    std::vector<unsigned char> gpu_gray_out(width * height);
+    // Transfer to device (timed separately)
+    Timer transferTimer;
+    err = clEnqueueWriteBuffer(queue, d_in, CL_TRUE, 0, imgSize, host_input, 0, NULL, NULL);
+    CHECK_CL(err);
+    double h2d_time = transferTimer.elapsed();
 
-    // 2. CPU BENCHMARKS
-    Timer t;
-    std::cout << "Running CPU Grayscale..." << std::endl;
-    cpu_grayscale(host_input, cpu_gray_out.data(), width, height);
-    double cpuGrayTime = t.elapsed();
-    csv << "Grayscale,CPU," << cpuGrayTime << "\n";
+    // Create kernel
+    cl_kernel k = clCreateKernel(program, kernelName.c_str(), &err);
+    CHECK_CL(err);
 
-    t.reset();
-    std::cout << "Running CPU Blur..." << std::endl;
-    cpu_blur(host_input, cpu_blur_out.data(), width, height);
-    double cpuBlurTime = t.elapsed();
-    csv << "Gaussian Blur,CPU," << cpuBlurTime << "\n";
+    // Set arguments
+    clSetKernelArg(k, 0, sizeof(cl_mem), &d_in);
+    clSetKernelArg(k, 1, sizeof(cl_mem), &d_out);
+    clSetKernelArg(k, 2, sizeof(int), &w);
+    clSetKernelArg(k, 3, sizeof(int), &h);
 
-    // 3. GPU SETUP
+    // Configure work dimensions
+    size_t localSizeArr[2] = { 16, 16 };
+    size_t globalSize[2] = { 
+        (size_t)((w + 15) / 16) * 16, 
+        (size_t)((h + 15) / 16) * 16 
+    };
+    size_t* localPtr = isLocal ? localSizeArr : NULL;
+
+    // Execute kernel with event profiling
+    cl_event kernelEvent;
+    err = clEnqueueNDRangeKernel(queue, k, 2, NULL, globalSize, localPtr, 0, NULL, &kernelEvent);
+    CHECK_CL(err);
+    clWaitForEvents(1, &kernelEvent);
+
+    // Get kernel execution time
+    cl_ulong time_start, time_end;
+    clGetEventProfilingInfo(kernelEvent, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
+    clGetEventProfilingInfo(kernelEvent, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
+    result.kernel_ms = (time_end - time_start) / 1000000.0; // Convert nanoseconds to milliseconds
+
+    // Transfer back (timed separately)
+    transferTimer.reset();
+    err = clEnqueueReadBuffer(queue, d_out, CL_TRUE, 0, imgSize, host_output, 0, NULL, NULL);
+    CHECK_CL(err);
+    double d2h_time = transferTimer.elapsed();
+
+    result.total_ms = totalTimer.elapsed();
+    result.transfer_ms = h2d_time + d2h_time;
+
+    // Cleanup
+    clReleaseEvent(kernelEvent);
+    clReleaseKernel(k);
+    clReleaseMemObject(d_in);
+    clReleaseMemObject(d_out);
+
+    return result;
+}
+
+int main() {
+    // 1. Initial OpenCL Setup with Profiling Enabled
     cl_int err;
     cl_uint numPlatforms;
     cl_platform_id platform;
     clGetPlatformIDs(1, &platform, &numPlatforms);
+    
     cl_device_id device;
     clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL);
     
-    cl_context context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
-    cl_command_queue queue = clCreateCommandQueue(context, device, 0, &err);
+    // Print device info
+    char deviceName[128];
+    clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(deviceName), deviceName, NULL);
+    std::cout << "Using GPU: " << deviceName << std::endl;
     
+    size_t localMemSize;
+    clGetDeviceInfo(device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(localMemSize), &localMemSize, NULL);
+    std::cout << "Local Memory: " << (localMemSize / 1024) << " KB" << std::endl << std::endl;
+
+    context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
+    CHECK_CL(err);
+    
+    // Create command queue WITH profiling enabled
+    queue = clCreateCommandQueue(context, device, CL_QUEUE_PROFILING_ENABLE, &err);
+    CHECK_CL(err);
+
     std::string sourceStr = loadKernelSource("kernels/filters.cl");
     const char* src = sourceStr.c_str();
-    cl_program program = clCreateProgramWithSource(context, 1, &src, NULL, &err);
-    clBuildProgram(program, 1, &device, NULL, NULL, NULL);
+    program = clCreateProgramWithSource(context, 1, &src, NULL, &err);
+    CHECK_CL(err);
     
-    // Check for build errors
+    err = clBuildProgram(program, 1, &device, NULL, NULL, NULL);
     if (err != CL_SUCCESS) {
-        char log[16384];
-        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
-        std::cerr << "Build Error Log:\n" << log << std::endl;
+        size_t log_size;
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
+        std::vector<char> log(log_size);
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), NULL);
+        std::cerr << "Build Error:\n" << log.data() << std::endl;
         exit(1);
     }
 
-    cl_kernel k_gray = clCreateKernel(program, "grayscale", &err);
-    CHECK_CL(err);
-    cl_kernel k_blur = clCreateKernel(program, "gaussian_blur", &err);
-    CHECK_CL(err);
-
-    size_t imgSize = width * height * channels;
-    size_t graySize = width * height;
-
-    // --- STANDARD GPU BENCHMARK (Baseline) ---
-    t.reset();
-    cl_mem d_in = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, imgSize, host_input, &err);
-    cl_mem d_out_gray = clCreateBuffer(context, CL_MEM_WRITE_ONLY, graySize, NULL, &err);
-    
-    clSetKernelArg(k_gray, 0, sizeof(cl_mem), &d_in);
-    clSetKernelArg(k_gray, 1, sizeof(cl_mem), &d_out_gray);
-    clSetKernelArg(k_gray, 2, sizeof(int), &width);
-    clSetKernelArg(k_gray, 3, sizeof(int), &height);
-    
-    size_t globalSize[2] = { (size_t)width, (size_t)height };
-    clEnqueueNDRangeKernel(queue, k_gray, 2, NULL, globalSize, NULL, 0, NULL, NULL);
-    clEnqueueReadBuffer(queue, d_out_gray, CL_TRUE, 0, graySize, gpu_gray_out.data(), 0, NULL, NULL);
-    double gpuGrayTime = t.elapsed();
-    csv << "Grayscale,GPU (Standard)," << gpuGrayTime << "\n";
-    std::cout << "GPU Grayscale (Standard) done: " << gpuGrayTime << " ms" << std::endl;
-
-    // GPU Blur
-    t.reset();
-    cl_mem d_out_blur = clCreateBuffer(context, CL_MEM_WRITE_ONLY, imgSize, NULL, &err);
-    
-    clSetKernelArg(k_blur, 0, sizeof(cl_mem), &d_in);
-    clSetKernelArg(k_blur, 1, sizeof(cl_mem), &d_out_blur);
-    clSetKernelArg(k_blur, 2, sizeof(int), &width);
-    clSetKernelArg(k_blur, 3, sizeof(int), &height);
-    
-    clEnqueueNDRangeKernel(queue, k_blur, 2, NULL, globalSize, NULL, 0, NULL, NULL);
-    clEnqueueReadBuffer(queue, d_out_blur, CL_TRUE, 0, imgSize, gpu_out.data(), 0, NULL, NULL);
-    double gpuBlurTime = t.elapsed();
-    csv << "Gaussian Blur,GPU (Standard)," << gpuBlurTime << "\n";
-    std::cout << "GPU Blur (Standard) done: " << gpuBlurTime << " ms" << std::endl;
-
-
-    // --- OPTIMIZATION 1: PINNED MEMORY (Zero-Copy) ---
-    t.reset();
-    cl_mem pinned_in = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, imgSize, NULL, &err);
-    CHECK_CL(err);
-    unsigned char* pinned_ptr_in = (unsigned char*)clEnqueueMapBuffer(queue, pinned_in, CL_TRUE, CL_MAP_WRITE, 0, imgSize, 0, NULL, NULL, &err);
-    CHECK_CL(err);
-    std::memcpy(pinned_ptr_in, host_input, imgSize);
-    clEnqueueUnmapMemObject(queue, pinned_in, pinned_ptr_in, 0, NULL, NULL);
-
-    cl_mem pinned_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, graySize, NULL, &err);
-    CHECK_CL(err);
-
-    clSetKernelArg(k_gray, 0, sizeof(cl_mem), &pinned_in);
-    clSetKernelArg(k_gray, 1, sizeof(cl_mem), &pinned_out);
-    clEnqueueNDRangeKernel(queue, k_gray, 2, NULL, globalSize, NULL, 0, NULL, NULL);
-    unsigned char* pinned_ptr_out = (unsigned char*)clEnqueueMapBuffer(queue, pinned_out, CL_TRUE, CL_MAP_READ, 0, graySize, 0, NULL, NULL, &err);
-    clEnqueueUnmapMemObject(queue, pinned_out, pinned_ptr_out, 0, NULL, NULL);
-    
-    double pinnedTime = t.elapsed();
-    csv << "Grayscale,GPU (Pinned)," << pinnedTime << "\n";
-    std::cout << "GPU Grayscale (Pinned) done: " << pinnedTime << " ms" << std::endl;
-
-    // --- OPTIMIZATION: LOCAL MEMORY TILING (FAIR SYSTEM TIME) ---
-    // We must measure: Upload -> Kernel -> Download
-    t.reset();
-
-    // 1. Create FRESH input buffer (This triggers the Host->Device Upload)
-    // Using COPY_HOST_PTR forces the copy to happen now.
-    cl_mem d_in_local = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, imgSize, host_input, &err);
-    CHECK_CL(err);
-
-    // 2. Create FRESH output buffer
-    cl_mem d_out_local = clCreateBuffer(context, CL_MEM_WRITE_ONLY, imgSize, NULL, &err);
-    CHECK_CL(err);
-
-    // 3. Setup Kernel
-    cl_kernel k_blur_local = clCreateKernel(program, "gaussian_blur_local", &err);
-    CHECK_CL(err);
-
-    clSetKernelArg(k_blur_local, 0, sizeof(cl_mem), &d_in_local);
-    clSetKernelArg(k_blur_local, 1, sizeof(cl_mem), &d_out_local);
-    clSetKernelArg(k_blur_local, 2, sizeof(int), &width);
-    clSetKernelArg(k_blur_local, 3, sizeof(int), &height);
-
-    // 4. Work Group Sizing
-    size_t localSize[2] = {16, 16};
-    size_t globalSizeRounded[2] = {
-        (size_t)((width + 15) / 16) * 16, 
-        (size_t)((height + 15) / 16) * 16
+    // 2. Multi-Res Configuration
+    struct TestImg { std::string label; std::string path; };
+    std::vector<TestImg> tests = {
+        {"480p", "test_images/480p.jpg"}, 
+        {"720p", "test_images/720p.jpg"},
+        {"1080p", "test_images/1080p.jpg"}, 
+        {"1440p", "test_images/1440p.jpg"}, 
+        {"4K", "test_images/4K.jpg"}
     };
 
-    // 5. Execute
-    CHECK_CL(clEnqueueNDRangeKernel(queue, k_blur_local, 2, NULL, globalSizeRounded, localSize, 0, NULL, NULL));
-    
-    // 6. Read Back (Device -> Host Download)
-    // The timer stops only after we have the data back in RAM.
-    CHECK_CL(clEnqueueReadBuffer(queue, d_out_local, CL_TRUE, 0, imgSize, gpu_out.data(), 0, NULL, NULL));
-    
-    double localTime = t.elapsed();
-    
-    csv << "Gaussian Blur,GPU (Local Mem)," << localTime << "\n";
-    std::cout << "GPU Blur (Local Mem) done: " << localTime << " ms" << std::endl;
+    std::ofstream csv("detailed_benchmark.csv");
+    csv << "Resolution,Width,Height,CPU_ms,GPU_Std_Total_ms,GPU_Std_Kernel_ms,GPU_Std_Transfer_ms,"
+        << "GPU_Local_Total_ms,GPU_Local_Kernel_ms,GPU_Local_Transfer_ms,Speedup_vs_CPU,Validation_MaxError\n";
 
-    // Cleanup local resources
-    clReleaseMemObject(d_in_local);
-    clReleaseMemObject(d_out_local);
-    clReleaseKernel(k_blur_local);
+    std::cout << "Starting Enhanced Multi-Resolution Benchmark..." << std::endl;
+    std::cout << "================================================================" << std::endl;
 
-    // --- CLEANUP ---
+    for (const auto& test : tests) {
+        int w, h, c;
+        unsigned char* data = stbi_load(test.path.c_str(), &w, &h, &c, 3);
+        if (!data) { 
+            std::cerr << "Skipping " << test.label << " (File not found)" << std::endl; 
+            continue; 
+        }
+
+        size_t imgSize = w * h * 3;
+        std::vector<unsigned char> cpu_output(imgSize);
+        std::vector<unsigned char> gpu_std_output(imgSize);
+        std::vector<unsigned char> gpu_local_output(imgSize);
+
+        // --- Warm-up Pass ---
+        runGpuTest("gaussian_blur", data, gpu_std_output.data(), w, h, false);
+        runGpuTest("gaussian_blur_local", data, gpu_local_output.data(), w, h, true);
+
+        const int iterations = 5;
+        double cpuSum = 0;
+        BenchmarkResult stdSum = {0, 0, 0};
+        BenchmarkResult locSum = {0, 0, 0};
+
+        for (int i = 0; i < iterations; i++) {
+            // CPU
+            Timer t_cpu;
+            cpu_blur(data, cpu_output.data(), w, h);
+            cpuSum += t_cpu.elapsed();
+
+            // GPU Standard
+            auto stdResult = runGpuTest("gaussian_blur", data, gpu_std_output.data(), w, h, false);
+            stdSum.total_ms += stdResult.total_ms;
+            stdSum.kernel_ms += stdResult.kernel_ms;
+            stdSum.transfer_ms += stdResult.transfer_ms;
+
+            // GPU Local Memory
+            auto locResult = runGpuTest("gaussian_blur_local", data, gpu_local_output.data(), w, h, true);
+            locSum.total_ms += locResult.total_ms;
+            locSum.kernel_ms += locResult.kernel_ms;
+            locSum.transfer_ms += locResult.transfer_ms;
+        }
+
+        // Average results
+        double cpuAvg = cpuSum / iterations;
+        BenchmarkResult stdAvg = {
+            stdSum.total_ms / iterations,
+            stdSum.kernel_ms / iterations,
+            stdSum.transfer_ms / iterations
+        };
+        BenchmarkResult locAvg = {
+            locSum.total_ms / iterations,
+            locSum.kernel_ms / iterations,
+            locSum.transfer_ms / iterations
+        };
+
+        // Validate outputs
+        double stdError = compareImages(cpu_output.data(), gpu_std_output.data(), imgSize);
+        double locError = compareImages(cpu_output.data(), gpu_local_output.data(), imgSize);
+        double maxError = std::max(stdError, locError);
+
+        // Calculate speedup
+        double speedup = cpuAvg / locAvg.kernel_ms;
+
+        // Print results
+        std::cout << "\n" << test.label << " (" << w << "x" << h << ")" << std::endl;
+        std::cout << "  CPU:              " << cpuAvg << " ms" << std::endl;
+        std::cout << "  GPU Standard:" << std::endl;
+        std::cout << "    Total:          " << stdAvg.total_ms << " ms" << std::endl;
+        std::cout << "    Kernel Only:    " << stdAvg.kernel_ms << " ms" << std::endl;
+        std::cout << "    Transfer:       " << stdAvg.transfer_ms << " ms" << std::endl;
+        std::cout << "  GPU Local Memory:" << std::endl;
+        std::cout << "    Total:          " << locAvg.total_ms << " ms" << std::endl;
+        std::cout << "    Kernel Only:    " << locAvg.kernel_ms << " ms" << std::endl;
+        std::cout << "    Transfer:       " << locAvg.transfer_ms << " ms" << std::endl;
+        std::cout << "  Speedup (CPU/GPU Kernel): " << speedup << "x" << std::endl;
+        std::cout << "  Validation Error: " << maxError << " (max pixel difference)" << std::endl;
+
+        // Save to CSV
+        csv << test.label << "," << w << "," << h << "," 
+            << cpuAvg << "," 
+            << stdAvg.total_ms << "," << stdAvg.kernel_ms << "," << stdAvg.transfer_ms << ","
+            << locAvg.total_ms << "," << locAvg.kernel_ms << "," << locAvg.transfer_ms << ","
+            << speedup << "," << maxError << "\n";
+
+        // Save sample output
+        if (test.label == "1080p") {
+            stbi_write_jpg("output_cpu_1080p.jpg", w, h, 3, cpu_output.data(), 95);
+            stbi_write_jpg("output_gpu_local_1080p.jpg", w, h, 3, gpu_local_output.data(), 95);
+            std::cout << "  [Saved output images for visual inspection]" << std::endl;
+        }
+
+        stbi_image_free(data);
+    }
+
+    // 3. Cleanup
     csv.close();
-    std::cout << "Benchmark Complete! Results saved." << std::endl;
-
-    clReleaseMemObject(d_in); clReleaseMemObject(d_out_gray); clReleaseMemObject(d_out_blur);
-    clReleaseMemObject(pinned_in); clReleaseMemObject(pinned_out);
-    clReleaseKernel(k_gray); clReleaseKernel(k_blur); clReleaseKernel(k_blur_local);
-    clReleaseProgram(program); clReleaseCommandQueue(queue); clReleaseContext(context);
-    stbi_image_free(host_input);
+    clReleaseProgram(program);
+    clReleaseCommandQueue(queue);
+    clReleaseContext(context);
     
+    std::cout << "\n================================================================" << std::endl;
+    std::cout << "Benchmark Complete! Results saved to detailed_benchmark.csv" << std::endl;
+
     return 0;
 }
