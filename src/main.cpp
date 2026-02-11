@@ -73,7 +73,7 @@ int main() {
     std::string inputPath = "input.jpg";
     int width, height, channels;
     unsigned char* host_input = stbi_load(inputPath.c_str(), &width, &height, &channels, 0);
-    if (!host_input) { std::cerr << "Load failed." << std::endl; return 1; }
+    if (!host_input) { std::cerr << "Load failed. Check input.jpg" << std::endl; return 1; }
     
     std::cout << "Benchmarking Image: " << width << "x" << height << std::endl;
     std::ofstream csv("benchmark_results.csv");
@@ -114,8 +114,18 @@ int main() {
     cl_program program = clCreateProgramWithSource(context, 1, &src, NULL, &err);
     clBuildProgram(program, 1, &device, NULL, NULL, NULL);
     
+    // Check for build errors
+    if (err != CL_SUCCESS) {
+        char log[16384];
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
+        std::cerr << "Build Error Log:\n" << log << std::endl;
+        exit(1);
+    }
+
     cl_kernel k_gray = clCreateKernel(program, "grayscale", &err);
+    CHECK_CL(err);
     cl_kernel k_blur = clCreateKernel(program, "gaussian_blur", &err);
+    CHECK_CL(err);
 
     size_t imgSize = width * height * channels;
     size_t graySize = width * height;
@@ -153,53 +163,81 @@ int main() {
     std::cout << "GPU Blur (Standard) done: " << gpuBlurTime << " ms" << std::endl;
 
 
-    // --- OPTIMIZATION: PINNED MEMORY (Zero-Copy) ---
-    // Instead of copying standard RAM -> Driver -> GPU, we map a driver-allocated pointer.
-    
+    // --- OPTIMIZATION 1: PINNED MEMORY (Zero-Copy) ---
     t.reset();
-    // 1. Allocate Pinned Input Buffer
     cl_mem pinned_in = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, imgSize, NULL, &err);
     CHECK_CL(err);
-    
-    // 2. Map it (Get pointer to write to)
     unsigned char* pinned_ptr_in = (unsigned char*)clEnqueueMapBuffer(queue, pinned_in, CL_TRUE, CL_MAP_WRITE, 0, imgSize, 0, NULL, NULL, &err);
     CHECK_CL(err);
-    
-    // 3. Copy Data (This is fast because it's a direct memcpy to pinned memory)
     std::memcpy(pinned_ptr_in, host_input, imgSize);
-    
-    // 4. Unmap (Tells driver we are done writing, GPU can take over)
     clEnqueueUnmapMemObject(queue, pinned_in, pinned_ptr_in, 0, NULL, NULL);
 
-    // 5. Allocate Pinned Output Buffer
     cl_mem pinned_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, graySize, NULL, &err);
     CHECK_CL(err);
 
-    // 6. Execute Kernel
     clSetKernelArg(k_gray, 0, sizeof(cl_mem), &pinned_in);
-    clSetKernelArg(k_gray, 1, sizeof(cl_mem), &pinned_out); // Use pinned output
-    
+    clSetKernelArg(k_gray, 1, sizeof(cl_mem), &pinned_out);
     clEnqueueNDRangeKernel(queue, k_gray, 2, NULL, globalSize, NULL, 0, NULL, NULL);
-
-    // 7. Map Output to Read (Wait for GPU to finish)
     unsigned char* pinned_ptr_out = (unsigned char*)clEnqueueMapBuffer(queue, pinned_out, CL_TRUE, CL_MAP_READ, 0, graySize, 0, NULL, NULL, &err);
-    
-    // 8. (Optional) Copy data out if you need to save it, or just use it right there.
-    // We stop the timer here because the data is now accessible to the CPU.
-    
     clEnqueueUnmapMemObject(queue, pinned_out, pinned_ptr_out, 0, NULL, NULL);
     
     double pinnedTime = t.elapsed();
     csv << "Grayscale,GPU (Pinned)," << pinnedTime << "\n";
     std::cout << "GPU Grayscale (Pinned) done: " << pinnedTime << " ms" << std::endl;
 
-    csv.close();
-    std::cout << "Benchmark Complete!" << std::endl;
+    // --- OPTIMIZATION: LOCAL MEMORY TILING (FAIR SYSTEM TIME) ---
+    // We must measure: Upload -> Kernel -> Download
+    t.reset();
+
+    // 1. Create FRESH input buffer (This triggers the Host->Device Upload)
+    // Using COPY_HOST_PTR forces the copy to happen now.
+    cl_mem d_in_local = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, imgSize, host_input, &err);
+    CHECK_CL(err);
+
+    // 2. Create FRESH output buffer
+    cl_mem d_out_local = clCreateBuffer(context, CL_MEM_WRITE_ONLY, imgSize, NULL, &err);
+    CHECK_CL(err);
+
+    // 3. Setup Kernel
+    cl_kernel k_blur_local = clCreateKernel(program, "gaussian_blur_local", &err);
+    CHECK_CL(err);
+
+    clSetKernelArg(k_blur_local, 0, sizeof(cl_mem), &d_in_local);
+    clSetKernelArg(k_blur_local, 1, sizeof(cl_mem), &d_out_local);
+    clSetKernelArg(k_blur_local, 2, sizeof(int), &width);
+    clSetKernelArg(k_blur_local, 3, sizeof(int), &height);
+
+    // 4. Work Group Sizing
+    size_t localSize[2] = {16, 16};
+    size_t globalSizeRounded[2] = {
+        (size_t)((width + 15) / 16) * 16, 
+        (size_t)((height + 15) / 16) * 16
+    };
+
+    // 5. Execute
+    CHECK_CL(clEnqueueNDRangeKernel(queue, k_blur_local, 2, NULL, globalSizeRounded, localSize, 0, NULL, NULL));
     
-    // Cleanup
+    // 6. Read Back (Device -> Host Download)
+    // The timer stops only after we have the data back in RAM.
+    CHECK_CL(clEnqueueReadBuffer(queue, d_out_local, CL_TRUE, 0, imgSize, gpu_out.data(), 0, NULL, NULL));
+    
+    double localTime = t.elapsed();
+    
+    csv << "Gaussian Blur,GPU (Local Mem)," << localTime << "\n";
+    std::cout << "GPU Blur (Local Mem) done: " << localTime << " ms" << std::endl;
+
+    // Cleanup local resources
+    clReleaseMemObject(d_in_local);
+    clReleaseMemObject(d_out_local);
+    clReleaseKernel(k_blur_local);
+
+    // --- CLEANUP ---
+    csv.close();
+    std::cout << "Benchmark Complete! Results saved." << std::endl;
+
     clReleaseMemObject(d_in); clReleaseMemObject(d_out_gray); clReleaseMemObject(d_out_blur);
     clReleaseMemObject(pinned_in); clReleaseMemObject(pinned_out);
-    clReleaseKernel(k_gray); clReleaseKernel(k_blur);
+    clReleaseKernel(k_gray); clReleaseKernel(k_blur); clReleaseKernel(k_blur_local);
     clReleaseProgram(program); clReleaseCommandQueue(queue); clReleaseContext(context);
     stbi_image_free(host_input);
     

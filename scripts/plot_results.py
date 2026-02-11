@@ -1,52 +1,38 @@
 import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
 
-# 1. Load Data
-try:
-    df = pd.read_csv('build/benchmark_results.csv', header=None, names=['Algorithm', 'Device', 'Time_ms'])
-    # Skip the header row if it exists (simple check)
-    if df.iloc[0]['Algorithm'] == 'Algorithm':
-        df = df.iloc[1:]
-        df['Time_ms'] = pd.to_numeric(df['Time_ms'])
-except Exception as e:
-    print(f"Error reading CSV: {e}")
-    exit()
+# Data from your latest run
+data = {
+    'Algorithm': ['Grayscale', 'Grayscale', 'Grayscale', 'Gaussian Blur', 'Gaussian Blur', 'Gaussian Blur'],
+    'Device': ['CPU', 'GPU (Standard)', 'GPU (Pinned)', 'CPU', 'GPU (Standard)', 'GPU (Local Mem)'],
+    'Time_ms': [52.06, 155.10, 129.78, 445.47, 129.46, 17.85]
+}
 
-# 2. Setup the Plot
-plt.figure(figsize=(10, 6))
-colors = []
-labels = []
-values = []
+df = pd.DataFrame(data)
 
-# Logic to assign colors
-for index, row in df.iterrows():
-    label = f"{row['Algorithm']} ({row['Device']})"
-    labels.append(label)
-    values.append(row['Time_ms'])
-    
-    if "CPU" in row['Device']:
-        colors.append('#d62728') # Red for CPU
-    elif "Pinned" in row['Device']:
-        colors.append('#2ca02c') # Green for Optimization
-    else:
-        colors.append('#1f77b4') # Blue for Standard GPU
+# Separate into two charts for clarity
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-# 3. Create Bar Chart
-bars = plt.barh(labels, values, color=colors)
+# Chart 1: The "Bandwidth Bottleneck" (Grayscale)
+gray_df = df[df['Algorithm'] == 'Grayscale']
+colors_g = ['#d62728', '#1f77b4', '#2ca02c'] # Red, Blue, Green
+bars1 = ax1.bar(gray_df['Device'], gray_df['Time_ms'], color=colors_g)
+ax1.set_title('Memory Bound: Grayscale (PCIe Bottleneck)', fontsize=12, fontweight='bold')
+ax1.set_ylabel('Time (ms) - Lower is Better')
+ax1.grid(axis='y', linestyle='--', alpha=0.3)
+ax1.bar_label(bars1, fmt='%.1f ms', padding=3)
 
-# 4. Styling
-plt.title('Optimization Impact: Pinned Memory vs Standard', fontsize=14, fontweight='bold')
-plt.xlabel('Execution Time (ms) - Lower is Better', fontsize=12)
-plt.grid(axis='x', linestyle='--', alpha=0.5)
+# Chart 2: The "Compute Victory" (Blur)
+blur_df = df[df['Algorithm'] == 'Gaussian Blur']
+colors_b = ['#d62728', '#1f77b4', '#9467bd'] # Red, Blue, Purple
+bars2 = ax2.bar(blur_df['Device'], blur_df['Time_ms'], color=colors_b)
+ax2.set_title('Compute Bound: Gaussian Blur (25x Speedup)', fontsize=12, fontweight='bold')
+ax2.grid(axis='y', linestyle='--', alpha=0.3)
+ax2.bar_label(bars2, fmt='%.1f ms', padding=3)
 
-# 5. Add Value Labels
-for bar in bars:
-    width = bar.get_width()
-    plt.text(width + 5, bar.get_y() + bar.get_height()/2, 
-             f'{width:.1f} ms', 
-             va='center', fontweight='bold')
-
+plt.suptitle('Final Benchmark: Heterogeneous Computing Performance', fontsize=16)
 plt.tight_layout()
-plt.savefig('benchmark_final.png')
-print("Graph saved to benchmark_final.png")
-plt.show()  
+plt.savefig('final_benchmark_result.png')
+print("Graph saved!")
+plt.show()
