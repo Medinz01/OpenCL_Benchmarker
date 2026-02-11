@@ -278,11 +278,6 @@ MIT License - see [LICENSE](LICENSE) for details
 - **Khronos Group** - OpenCL specification
 - **NVIDIA** - GPU architecture documentation
 
-## 📧 Contact
-
-**Your Name** - yourname@email.com  
-Project Link: [https://github.com/yourusername/OpenCL_Benchmarker](https://github.com/yourusername/OpenCL_Benchmarker)
-
 ---
 
 ## 💡 Key Takeaway
